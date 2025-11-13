@@ -1,0 +1,4 @@
+{
+  "WS_URL": "wss://influxes.ladorianids.es:5000",
+  "overlay": true
+}
