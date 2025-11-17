@@ -6,6 +6,7 @@
     "idcamera": 471,
     "email": "laboratorio@ladorian.com",
     "showGenderCounter": true,
+    "apiurl": "https://people.ladorianids.es/ws/people/create",
     "detectArea": {
         "enabled": true,
         "x": 160,

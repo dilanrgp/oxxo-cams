@@ -1,3 +1,18 @@
+(function () {
+    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+
+    HTMLCanvasElement.prototype.getContext = function (type, options) {
+        if (type === '2d') {
+            if (!options || typeof options !== 'object') {
+                options = { willReadFrequently: true };
+            } else if (options.willReadFrequently !== true) {
+                options = Object.assign({}, options, { willReadFrequently: true });
+            }
+        }
+        return originalGetContext.call(this, type, options);
+    };
+})();
+
 const elVideo = document.getElementById('video')
 
 navigator.getMedia = (navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia)
@@ -66,7 +81,7 @@ function loadConfig() {
         return
     }
 
-    fetch('./config.json')
+    fetch('../config.json')
         .then(response => {
             if (!response.ok) {
                 throw new Error('Respuesta no OK al cargar config.json')
@@ -183,7 +198,7 @@ async function sendFaceExpiredToApi(face, now) {
 
         const { ts, keyhash } = await getTimestampAndKeyhash()
 
-        const url = `https://people.ladorianids.es/ws/people/create?timestamp=${ts}&keyhash=${keyhash}`
+        const url = `${config.apiurl}?timestamp=${ts}&keyhash=${keyhash}`
 
         const ageNumber = (typeof face.age === 'number') ? Math.round(face.age) : null
         const genderStr = face.gender || null
@@ -384,14 +399,14 @@ function drawGenderCounter(ctx, canvas) {
 // =========================
 
 Promise.all([
-    faceapi.nets.ssdMobilenetv1.loadFromUri('./models'),
-    faceapi.nets.ageGenderNet.loadFromUri('./models'),
-    faceapi.nets.faceExpressionNet.loadFromUri('./models'),
-    faceapi.nets.faceLandmark68Net.loadFromUri('./models'),
-    faceapi.nets.faceLandmark68TinyNet.loadFromUri('./models'),
-    faceapi.nets.faceRecognitionNet.loadFromUri('./models'),
-    faceapi.nets.ssdMobilenetv1.loadFromUri('./models'),
-    faceapi.nets.tinyFaceDetector.loadFromUri('./models'),
+    faceapi.nets.ssdMobilenetv1.loadFromUri('../models'),
+    faceapi.nets.ageGenderNet.loadFromUri('../models'),
+    faceapi.nets.faceExpressionNet.loadFromUri('../models'),
+    faceapi.nets.faceLandmark68Net.loadFromUri('../models'),
+    faceapi.nets.faceLandmark68TinyNet.loadFromUri('../models'),
+    faceapi.nets.faceRecognitionNet.loadFromUri('../models'),
+    faceapi.nets.ssdMobilenetv1.loadFromUri('../models'),
+    faceapi.nets.tinyFaceDetector.loadFromUri('../models'),
 ]).then(cargarCamera)
 
 elVideo.addEventListener('play', async () => {
@@ -430,7 +445,7 @@ elVideo.addEventListener('play', async () => {
         // Ajustar detecciones al tamaño del vídeo
         const resizedDetections = faceapi.resizeResults(detections, displaySize)
 
-        const ctx = canvas.getContext('2d')
+        const ctx = canvas.getContext('2d', { willReadFrequently: true })
         // 3. Limpiar el canvas
         ctx.clearRect(0, 0, canvas.width, canvas.height)
 
@@ -494,7 +509,7 @@ elVideo.addEventListener('play', async () => {
                 ? faceData.gender
                 : rawGender
 
-            const label = `ID ${faceId} - ${displayAge} años ${displayGender}`
+            const label = `ID ${faceId} - ${displayAge} years ${displayGender}`
 
             new faceapi.draw.DrawBox(box, {
                 label
