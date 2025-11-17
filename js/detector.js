@@ -1,40 +1,44 @@
 (async function () {
-  // CONFIGURACIÓN - Cambia esto según tu servidor
-  // const WS_URL = 'wss://influxes.ladorianids.es:5000'; // localhost o tu IP
+  // ============================================================
+  // CONFIGURACIÓN
+  // ============================================================
   const { WS_URL, OVERLAY } = await (async function getConfig() {
-    const res = await fetch('/config.json', { cache: 'no-store' });
+    const res = await fetch('../config.json', { cache: 'no-store' });
     const cfg = await res.json();
-    // Si "overlay" no existe, por defecto true (se dibuja)
-    return { WS_URL: cfg.WS_URL, OVERLAY: (typeof cfg.overlay === 'boolean') ? cfg.overlay : true };
-  })(); // localhost o tu IP
+    return { 
+      WS_URL: cfg.WS_URL, 
+      OVERLAY: (typeof cfg.overlay === 'boolean') ? cfg.overlay : true 
+    };
+  })();
 
-  const FACE_CONFIDENCE_THRESHOLD = 0.8;
-  const DUPLICATE_TIMEOUT = 10 * 1000; // pruebas: 10s (luego súbelo a 60–120s)
-  const SIMILARITY_THRESHOLD = 0.15;     // antes 0.28
-  const BBOX_CENTER_TOL = 0.03;     // antes 0.08
-  const BBOX_SIZE_TOL = 0.08;     // antes 0.18
-  const EMA_ALPHA = 0.25;
-  const FACE_CHECK_INTERVAL = 500;
-  const MIN_SEND_INTERVAL = 2000; // 2s
-  const MAX_CACHE = 50;
+  // Parámetros de detección y tracking
+  const CONFIG = {
+    FACE_CONFIDENCE_THRESHOLD: 0.7,
+    DUPLICATE_TIMEOUT: 10 * 1000,
+    FACE_CHECK_INTERVAL: 500,
+    MIN_SEND_INTERVAL: 2000,
+    NEW_FACE_CONFIRM_MS: 600,
+    MAX_CACHE: 50,
+    MIN_FACE_SIZE: 0.08,
+    MAX_FACE_SIZE: 0.6,
+    DETECT_REPORT_MIN_MS: 1200,
+    JPEG_QUALITY: 0.85,
+    MAX_BACKPRESSURE: 4_000_000
+  };
 
+  // ============================================================
+  // ESTADO GLOBAL
+  // ============================================================
   const seenFaces = new Map();
-
-  const pending = new Map();          // caras candidatas
-  const NEW_FACE_CONFIRM_MS = 600;    // ventana para confirmar
-
+  const pending = new Map();
   let lastNumDetections = -1;
   let lastDetectReport = 0;
-  const DETECT_REPORT_MIN_MS = 1200;
+  let lastCheck = 0;
+  let jpegQuality = CONFIG.JPEG_QUALITY;
 
-  function keyFromBBox(b) {
-    // celda gruesa por centro y tamaño (normalizados 0..1)
-    const cx = Math.round(b.cx * 20), cy = Math.round(b.cy * 20);
-    const s = Math.round(Math.hypot(b.w, b.h) * 20);
-    return `${cx}_${cy}_${s}`;
-  }
-
-  // Función para reportar estado al padre
+  // ============================================================
+  // UTILIDADES
+  // ============================================================
   function report(msg) {
     try {
       parent.postMessage({ type: 'status', msg }, '*');
@@ -43,47 +47,182 @@
     }
   }
 
-  // 1) Verificar que TensorFlow y BlazeFace están cargados
-  if (typeof tf === 'undefined') {
-    report('❌ TensorFlow.js no cargado');
+  function getBBox(detection) {
+    const box = detection.detection.box;
+    const cx = (box.x + box.width / 2) / TARGET_W;
+    const cy = (box.y + box.height / 2) / TARGET_H;
+    const w = box.width / TARGET_W;
+    const h = box.height / TARGET_H;
+    return { cx, cy, w, h };
+  }
+
+  function keyFromBBox(b) {
+    const cx = Math.round(b.cx * 20);
+    const cy = Math.round(b.cy * 20);
+    const s = Math.round(Math.hypot(b.w, b.h) * 20);
+    return `${cx}_${cy}_${s}`;
+  }
+
+  function isSimilarBBox(b1, b2, centerTol = 0.03, sizeTol = 0.08) {
+    const dcx = Math.abs(b1.cx - b2.cx);
+    const dcy = Math.abs(b1.cy - b2.cy);
+    const dw = Math.abs(b1.w - b2.w);
+    const dh = Math.abs(b1.h - b2.h);
+    return (dcx < centerTol && dcy < centerTol && dw < sizeTol && dh < sizeTol);
+  }
+
+  function extractDescriptor(detection) {
+    // Face-API.js proporciona un descriptor de 128 dimensiones
+    return detection.descriptor ? Array.from(detection.descriptor) : null;
+  }
+
+  function compareDescriptors(desc1, desc2) {
+    if (!desc1 || !desc2 || desc1.length !== desc2.length) return 1;
+    
+    // Distancia euclidiana
+    let sum = 0;
+    for (let i = 0; i < desc1.length; i++) {
+      const d = desc1[i] - desc2[i];
+      sum += d * d;
+    }
+    return Math.sqrt(sum);
+  }
+
+  function isFaceAlreadySent(detection) {
+    const now = Date.now();
+    const descriptor = extractDescriptor(detection);
+    const bbox = getBBox(detection);
+    let bestKey = null;
+    let bestScore = Infinity;
+
+    for (const [hash, data] of seenFaces.entries()) {
+      if (now - data.timestamp > CONFIG.DUPLICATE_TIMEOUT) continue;
+
+      // Comparación por descriptor (más preciso que landmarks)
+      if (descriptor && data.descriptor) {
+        const dist = compareDescriptors(descriptor, data.descriptor);
+        if (dist < bestScore) {
+          bestScore = dist;
+          bestKey = hash;
+        }
+      }
+
+      // Fallback: comparación por bbox
+      if (data.bbox && isSimilarBBox(bbox, data.bbox)) {
+        data.timestamp = now;
+        data.descriptor = descriptor;
+        data.bbox = bbox;
+        return { known: true, key: hash };
+      }
+    }
+
+    // Umbral de similitud para descriptores (ajustable)
+    if (bestScore < 0.6) {
+      const rec = seenFaces.get(bestKey);
+      rec.timestamp = now;
+      rec.descriptor = descriptor;
+      rec.bbox = bbox;
+      return { known: true, key: bestKey };
+    }
+
+    return { known: false, key: null };
+  }
+
+  function markFaceAsSent(detection, existingKey = null) {
+    const descriptor = extractDescriptor(detection);
+    const bbox = getBBox(detection);
+    const now = Date.now();
+
+    if (existingKey && seenFaces.has(existingKey)) {
+      const rec = seenFaces.get(existingKey);
+      rec.descriptor = descriptor;
+      rec.bbox = bbox;
+      rec.timestamp = now;
+      return existingKey;
+    }
+
+    const hash = 'face_' + now + '_' + Math.random().toString(36).slice(2, 9);
+    seenFaces.set(hash, { 
+      timestamp: now, 
+      descriptor, 
+      bbox, 
+      lastSent: 0 
+    });
+    return hash;
+  }
+
+  function cleanOldFaces() {
+    const now = Date.now();
+    for (const [hash, data] of seenFaces) {
+      if (now - data.timestamp > CONFIG.DUPLICATE_TIMEOUT) {
+        seenFaces.delete(hash);
+      }
+    }
+    
+    if (seenFaces.size > CONFIG.MAX_CACHE) {
+      const entries = [...seenFaces.entries()]
+        .sort((a, b) => a[1].timestamp - b[1].timestamp);
+      const toDrop = entries.slice(0, seenFaces.size - CONFIG.MAX_CACHE);
+      toDrop.forEach(([k]) => seenFaces.delete(k));
+    }
+  }
+
+  function isFaceSizeValid(detection) {
+    const box = detection.detection.box;
+    const w = box.width / TARGET_W;
+    const h = box.height / TARGET_H;
+    return w >= CONFIG.MIN_FACE_SIZE && 
+           h >= CONFIG.MIN_FACE_SIZE && 
+           w <= CONFIG.MAX_FACE_SIZE && 
+           h <= CONFIG.MAX_FACE_SIZE;
+  }
+
+  // ============================================================
+  // INICIALIZACIÓN DE FACE-API.JS
+  // ============================================================
+  if (typeof faceapi === 'undefined') {
+    report('❌ Face-API.js no cargado');
     return;
   }
 
-  if (typeof blazeface === 'undefined') {
-    report('❌ BlazeFace no cargado');
+  report('Cargando modelos Face-API.js...');
+
+  // Determinar ruta de modelos
+  const modelsPath = (typeof chrome !== 'undefined' && chrome.runtime?.getURL)
+    ? chrome.runtime.getURL('models/faceapi/')
+    : new URL('../models/faceapi/', location.href).toString();
+
+  console.log('📦 Cargando modelos desde:', modelsPath);
+
+  try {
+    // Cargar modelos necesarios
+    await Promise.all([
+      faceapi.nets.tinyFaceDetector.loadFromUri(modelsPath),
+      faceapi.nets.faceLandmark68Net.loadFromUri(modelsPath),
+      faceapi.nets.faceRecognitionNet.loadFromUri(modelsPath),
+      faceapi.nets.ageGenderNet.loadFromUri(modelsPath),
+      faceapi.nets.faceExpressionNet.loadFromUri(modelsPath)
+    ]);
+
+    report('✅ Modelos cargados. Esperando frames...');
+  } catch (error) {
+    report('❌ Error cargando modelos: ' + error.message);
+    console.error(error);
     return;
   }
 
-  // 2) Configurar backend y cargar modelo
-  await tf.setBackend('webgl');
-  await tf.ready();
-
-  report('Cargando modelo...');
-
-  // Determinar URL del modelo (funciona en extensión y local)
-  const modelUrl = (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getURL)
-    ? chrome.runtime.getURL('models/blazeface/model.json')
-    : new URL('../models/blazeface/model.json', location.href).toString();
-
-  console.log('📦 Cargando modelo desde:', modelUrl);
-
-  const model = await blazeface.load({
-    modelUrl,
-    maxFaces: 5,
-    iouThreshold: 0.3,
-    scoreThreshold: 0.85
-  });
-
-  report('✅ Modelo cargado. Esperando frames...');
-
-  // 3) Canvas de trabajo
+  // ============================================================
+  // CANVAS DE TRABAJO
+  // ============================================================
   let TARGET_W = 640, TARGET_H = 480;
-  const c = document.createElement('canvas');
-  c.width = TARGET_W;
-  c.height = TARGET_H;
-  const x = c.getContext('2d', { willReadFrequently: true });
+  const canvas = document.createElement('canvas');
+  canvas.width = TARGET_W;
+  canvas.height = TARGET_H;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-  // 4) WebSocket para enviar frames
+  // ============================================================
+  // WEBSOCKET
+  // ============================================================
   let ws, backoff = 500;
 
   function openWS() {
@@ -113,255 +252,128 @@
 
   openWS();
 
-  // 5) Utilidades de tracking (igual que tu código original)
-  function getBBox(pred) {
-    const [x1, y1] = pred.topLeft;
-    const [x2, y2] = pred.bottomRight;
-    const w = x2 - x1, h = y2 - y1;
-    const cx = (x1 + x2) / 2 / TARGET_W;
-    const cy = (y1 + y2) / 2 / TARGET_H;
-    return { cx, cy, w: w / TARGET_W, h: h / TARGET_H };
-  }
-
-  function isSimilarBBox(b1, b2, centerTol = BBOX_CENTER_TOL, sizeTol = BBOX_SIZE_TOL) {
-    const dcx = Math.abs(b1.cx - b2.cx);
-    const dcy = Math.abs(b1.cy - b2.cy);
-    const dw = Math.abs(b1.w - b2.w);
-    const dh = Math.abs(b1.h - b2.h);
-    return (dcx < centerTol && dcy < centerTol && dw < sizeTol && dh < sizeTol);
-  }
-
-  function adaptiveTols(b) {
-    const diag = Math.max(0.02, Math.hypot(b.w, b.h)); // 0..1
-    const k = Math.max(1, 0.06 / diag); // caras pequeñas ⇒ k>1
-    return { center: BBOX_CENTER_TOL * k, size: BBOX_SIZE_TOL * k };
-  }
-
-  function emaFeatures(prev, next) {
-    if (!prev || prev.length !== next.length) return next.slice();
-    const out = new Array(next.length);
-    for (let i = 0; i < next.length; i++) {
-      out[i] = EMA_ALPHA * next[i] + (1 - EMA_ALPHA) * prev[i];
-    }
-    return out;
-  }
-
-  function extractFaceFeatures(pred) {
-    const [x1, y1] = pred.topLeft;
-    const [x2, y2] = pred.bottomRight;
-    const w = x2 - x1, h = y2 - y1;
-    const feats = [];
-
-    if (pred.landmarks && pred.landmarks.length >= 6) {
-      const cx = (x1 + x2) / 2;
-      const cy = (y1 + y2) / 2;
-
-      for (const lm of pred.landmarks) {
-        feats.push((lm[0] - cx) / w, (lm[1] - cy) / h);
-      }
-    }
-
-    feats.push(w / h);
-    return feats;
-  }
-
-  function isBigEnough(pred, minFrac = 0.03) {
-    const [x1, y1] = pred.topLeft;
-    const [x2, y2] = pred.bottomRight;
-    const w = (x2 - x1) / TARGET_W;
-    const h = (y2 - y1) / TARGET_H;
-    return w >= minFrac && h >= minFrac;
-  }
-
-  function isTooBig(pred, maxFrac = 0.6) {
-    const [x1, y1] = pred.topLeft;
-    const [x2, y2] = pred.bottomRight;
-    const w = (x2 - x1) / TARGET_W;
-    const h = (y2 - y1) / TARGET_H;
-    return w > maxFrac || h > maxFrac;
-  }
-
-  function isFaceAlreadySent(pred) {
-    const now = Date.now();
-    const features = extractFaceFeatures(pred);
-    const bbox = getBBox(pred);
-    let bestKey = null;
-    let bestScore = Infinity;
-
-    for (const [hash, data] of seenFaces.entries()) {
-      if (now - data.timestamp > DUPLICATE_TIMEOUT) continue;
-
-      // Chequeo rápido por bbox
-      if (data.bbox) {
-        const t = adaptiveTols(data.bbox);
-        if (isSimilarBBox(bbox, data.bbox, t.center, t.size)) {
-          data.timestamp = now;
-          data.features = emaFeatures(data.features, features);
-          data.bbox = bbox;
-          return { known: true, key: hash };
-        }
-      }
-
-      // Distancia por landmarks
-      if (data.features && data.features.length === features.length) {
-        let sum = 0;
-        for (let i = 0; i < features.length; i++) {
-          const d = features[i] - data.features[i];
-          sum += d * d;
-        }
-        const dist = Math.sqrt(sum / features.length);
-        if (dist < bestScore) {
-          bestScore = dist;
-          bestKey = hash;
-        }
-      }
-    }
-
-    if (bestScore < SIMILARITY_THRESHOLD) {
-      const rec = seenFaces.get(bestKey);
-      rec.timestamp = now;
-      rec.features = emaFeatures(rec.features, features);
-      rec.bbox = bbox;
-      return { known: true, key: bestKey };
-    }
-
-    return { known: false, key: null };
-  }
-
-  function markFaceAsSent(pred, existingKey = null) {
-    const features = extractFaceFeatures(pred);
-    const bbox = getBBox(pred);
-    const now = Date.now();
-
-    if (existingKey && seenFaces.has(existingKey)) {
-      const rec = seenFaces.get(existingKey);
-      rec.features = emaFeatures(rec.features, features);
-      rec.bbox = bbox;
-      rec.timestamp = now;
-      return existingKey;
-    }
-
-    const hash = 'face_' + now + '_' + Math.random().toString(36).slice(2, 9);
-    seenFaces.set(hash, { timestamp: now, features, bbox, lastSent: 0 });
-    return hash;
-  }
-
-  function cleanOldFaces() {
-    const now = Date.now();
-    for (const [hash, data] of seenFaces) {
-      if (now - data.timestamp > DUPLICATE_TIMEOUT) seenFaces.delete(hash);
-    }
-    if (seenFaces.size > MAX_CACHE) {
-      const entries = [...seenFaces.entries()].sort((a, b) => a[1].timestamp - b[1].timestamp);
-      const toDrop = entries.slice(0, seenFaces.size - MAX_CACHE);
-      toDrop.forEach(([k]) => seenFaces.delete(k));
-    }
-  }
-
-  // 6) Recibir frames del padre y detectar
-  let lastCheck = 0;
-  let Q = 0.85;
-
+  // ============================================================
+  // PROCESAMIENTO DE FRAMES
+  // ============================================================
   window.addEventListener('message', async (e) => {
     const data = e.data;
     if (!data || data.type !== 'frame' || !data.bitmap) return;
 
-    // Actualizar tamaño si cambia
+    // Actualizar dimensiones si cambian
     if (data.w && data.h && (data.w !== TARGET_W || data.h !== TARGET_H)) {
       TARGET_W = data.w;
       TARGET_H = data.h;
-      c.width = TARGET_W;
-      c.height = TARGET_H;
+      canvas.width = TARGET_W;
+      canvas.height = TARGET_H;
     }
 
     const now = performance.now();
-    if (now - lastCheck < FACE_CHECK_INTERVAL) {
+    if (now - lastCheck < CONFIG.FACE_CHECK_INTERVAL) {
       data.bitmap.close?.();
       return;
     }
     lastCheck = now;
 
     // Pintar bitmap en canvas
-    x.drawImage(data.bitmap, 0, 0, TARGET_W, TARGET_H);
+    ctx.drawImage(data.bitmap, 0, 0, TARGET_W, TARGET_H);
     data.bitmap.close?.();
 
     try {
-      // Limpiar caras viejas ocasionalmente
-      // if (Math.random() < 0.1) cleanOldFaces();
       cleanOldFaces();
 
-      const predictions = await model.estimateFaces(c, false);
+      // ============================================================
+      // DETECCIÓN CON FACE-API.JS
+      // Incluye: detección + landmarks + descriptor + edad + género + expresiones
+      // ============================================================
+      const detections = await faceapi
+        .detectAllFaces(canvas, new faceapi.TinyFaceDetectorOptions({
+          inputSize: 416,
+          scoreThreshold: CONFIG.FACE_CONFIDENCE_THRESHOLD
+        }))
+        .withFaceLandmarks()
+        .withFaceDescriptors()
+        .withAgeAndGender()
+        .withFaceExpressions();
 
-      if (predictions.length) {
+      if (detections.length) {
         const toSend = [];
 
-        for (const pred of predictions) {
-          const conf = Array.isArray(pred.probability) ? pred.probability[0] : 1;
-          // if (conf <= FACE_CONFIDENCE_THRESHOLD) continue;
-          if (!isBigEnough(pred, 0.08)) continue;
-          if (isTooBig(pred)) continue;
+        for (const detection of detections) {
+          if (!isFaceSizeValid(detection)) continue;
 
-          // const res = isFaceAlreadySent(pred);
-
-          // const key = res.known ? res.key : null;
-          // const lastSent = key && seenFaces.get(key)?.lastSent || 0;
-          // if (res.known && (Date.now() - lastSent < MIN_SEND_INTERVAL)) {
-          //   console.log('↩︎ Cara conocida (no envío)');
-          //   markFaceAsSent(pred, res.key);
-          // } else {
-          //   console.log('➕ Cara NUEVA (enviar)');
-          //   newFaces.push(pred);
-          // }
-
-          const res = isFaceAlreadySent(pred);
+          const res = isFaceAlreadySent(detection);
           const nowMs = Date.now();
 
           if (res.known) {
             const key = res.key;
             const lastSent = seenFaces.get(key)?.lastSent || 0;
-            if (nowMs - lastSent < MIN_SEND_INTERVAL) {
-              // misma cara, solo refrescamos su rastro
-              markFaceAsSent(pred, key);
+            
+            if (nowMs - lastSent < CONFIG.MIN_SEND_INTERVAL) {
+              markFaceAsSent(detection, key);
             } else {
-              toSend.push({ pred, key }); // misma persona, vamos a ENVIAR usando su key
+              toSend.push({ detection, key });
             }
           } else {
-            // 1ª vez que la vemos: queda "pendiente" hasta confirmar
-            const bbox = getBBox(pred);
+            // Nueva cara: confirmación antes de enviar
+            const bbox = getBBox(detection);
             const k = keyFromBBox(bbox);
             const cand = pending.get(k);
-            if (cand && (nowMs - cand.t) < NEW_FACE_CONFIRM_MS && isSimilarBBox(bbox, cand.bbox)) {
+            
+            if (cand && 
+                (nowMs - cand.t) < CONFIG.NEW_FACE_CONFIRM_MS && 
+                isSimilarBBox(bbox, cand.bbox)) {
               pending.delete(k);
-              const newKey = markFaceAsSent(pred); // crea entrada y devuelve hash
-              toSend.push({ pred, key: newKey });
+              const newKey = markFaceAsSent(detection);
+              toSend.push({ detection, key: newKey });
             } else {
               pending.set(k, { t: nowMs, bbox });
             }
           }
         }
 
-        // Overlay controlado por config.json (booleano `overlay`).
+        // ============================================================
+        // OVERLAY CON INFORMACIÓN ENRIQUECIDA
+        // ============================================================
         if (OVERLAY) {
-          const boxes = predictions.map(p => {
-            const [x1, y1] = p.topLeft;
-            const [x2, y2] = p.bottomRight;
-            const w = x2 - x1, h = y2 - y1;
-            const cx = x1 + w / 2, cy = y1 + h / 2;
+          const boxes = detections.map(d => {
+            const box = d.detection.box;
+            const age = Math.round(d.age);
+            const gender = d.gender;
+            const genderProb = Math.round(d.genderProbability * 100);
+            
+            // Expresión dominante
+            const expressions = d.expressions;
+            const dominantExpression = Object.entries(expressions)
+              .sort((a, b) => b[1] - a[1])[0];
+            const [emotion, emotionProb] = dominantExpression;
+            
+            // Expandir bbox
+            const cx = box.x + box.width / 2;
+            const cy = box.y + box.height / 2;
+            const newW = box.width * 1.10;
+            const newH = box.height * 1.20;
+            
+            let x1 = Math.max(0, cx - newW / 2);
+            let y1 = Math.max(0, cy - newH / 2);
+            let x2 = Math.min(TARGET_W, cx + newW / 2);
+            let y2 = Math.min(TARGET_H, cy + newH / 2);
 
-            // Ajustes:
-            // - +10% de ancho ≈ cubrir orejas
-            // - +20% de alto ≈ cubrir frente y barbilla
-            const newW = w * 1.10;
-            const newH = h * 1.20;
+            // Color según emoción
+            const emotionColors = {
+              happy: '#00ff00',
+              sad: '#0080ff',
+              angry: '#ff0000',
+              surprised: '#ffff00',
+              neutral: '#ffffff',
+              disgusted: '#ff00ff',
+              fearful: '#ff8000'
+            };
 
-            let nx1 = cx - newW / 2, ny1 = cy - newH / 2;
-            let nx2 = cx + newW / 2, ny2 = cy + newH / 2;
-
-            // Limitar a los bordes del frame (TARGET_W/H están en tu archivo)
-            nx1 = Math.max(0, nx1); ny1 = Math.max(0, ny1);
-            nx2 = Math.min(TARGET_W, nx2); ny2 = Math.min(TARGET_H, ny2);
-
-            return { x1: nx1, y1: ny1, x2: nx2, y2: ny2 };
+            return {
+              x1, y1, x2, y2,
+              color: emotionColors[emotion] || '#00ff00',
+              label: `${gender} ${age}y - ${emotion} ${Math.round(emotionProb * 100)}%`
+            };
           });
 
           parent.postMessage({ type: 'detections', boxes }, '*');
@@ -369,42 +381,68 @@
           parent.postMessage({ type: 'detections', boxes: [] }, '*');
         }
 
-
-        const num = predictions.length;
+        // Reportar detecciones
+        const num = detections.length;
         const nowR = Date.now();
-        if (num !== lastNumDetections || (nowR - lastDetectReport) > DETECT_REPORT_MIN_MS) {
+        if (num !== lastNumDetections || 
+            (nowR - lastDetectReport) > CONFIG.DETECT_REPORT_MIN_MS) {
           report(`Detectadas ${num} cara(s)`);
           lastNumDetections = num;
           lastDetectReport = nowR;
         }
 
-        // Enviar frames con caras nuevas
+        // ============================================================
+        // ENVÍO POR WEBSOCKET
+        // ============================================================
         if (toSend.length && ws && ws.readyState === 1) {
-          // Registrar/actualizar exactamente esas caras (usando su key)
-          toSend.forEach(({ pred, key }) => markFaceAsSent(pred, key));
+          toSend.forEach(({ detection, key }) => {
+            markFaceAsSent(detection, key);
+            
+            // Actualizar metadata de la cara en seenFaces
+            const rec = seenFaces.get(key);
+            if (rec) {
+              rec.age = Math.round(detection.age);
+              rec.gender = detection.gender;
+              rec.genderProbability = detection.genderProbability;
+              rec.expressions = detection.expressions;
+            }
+          });
 
           // Control de backpressure
           const buf = ws.bufferedAmount;
-          if (buf > 4_000_000) {
-            Q = Math.max(0.75, Q - 0.05);
-          } else if (buf < 500_000 && Q < 0.9) {
-            Q = Math.min(0.9, Q + 0.01);
+          if (buf > CONFIG.MAX_BACKPRESSURE) {
+            jpegQuality = Math.max(0.75, jpegQuality - 0.05);
+          } else if (buf < 500_000 && jpegQuality < 0.9) {
+            jpegQuality = Math.min(0.9, jpegQuality + 0.01);
           }
 
-          c.toBlob(async (b) => {
-            if (!b) return;
-            const ab = await b.arrayBuffer();
+          canvas.toBlob(async (blob) => {
+            if (!blob) return;
+            
+            const ab = await blob.arrayBuffer();
             ws.send(ab);
+            
             const now = Date.now();
-            for (const [k, rec] of seenFaces) rec.lastSent = now;
-            const active = [...seenFaces.values()].filter(r => Date.now() - r.timestamp <= DUPLICATE_TIMEOUT).length;
+            for (const [k, rec] of seenFaces) {
+              rec.lastSent = now;
+            }
+            
+            const active = [...seenFaces.values()]
+              .filter(r => Date.now() - r.timestamp <= CONFIG.DUPLICATE_TIMEOUT)
+              .length;
 
             report(`✓ Frame enviado (${active} caras en memoria)`);
-            console.log(`📤 Frame enviado con ${toSend.length} cara(s) lista(s)`);
-          }, 'image/jpeg', Q);
+            console.log(`📤 Frame con ${toSend.length} cara(s)`, 
+              toSend.map(({ detection }) => ({
+                age: Math.round(detection.age),
+                gender: detection.gender,
+                emotion: Object.entries(detection.expressions)
+                  .sort((a, b) => b[1] - a[1])[0][0]
+              }))
+            );
+          }, 'image/jpeg', jpegQuality);
         }
       } else {
-        report('Sin caras detectadas');
         parent.postMessage({ type: 'detections', boxes: [] }, '*');
       }
     } catch (err) {
@@ -413,5 +451,5 @@
     }
   });
 
-  console.log('✅ Detector inicializado');
+  console.log('✅ Detector Face-API.js inicializado');
 })();
