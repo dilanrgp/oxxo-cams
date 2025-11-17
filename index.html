@@ -1,21 +1,15 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Ladorian Cams</title>
-  <link rel="stylesheet" href="./style.css">
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reconocimiento Facial</title>
+    <script src="./face-api.min.js" defer></script>
+    <script src="./script.js" defer></script>
+    <link rel="stylesheet" href="./style.css">
 </head>
 <body>
-  <div id="status" class="hud">Inicializando…</div>
-
-  <div id="preview">
-    <canvas id="mirror" width="640" height="480"></canvas>
-    <canvas id="overlay" width="640" height="480"></canvas>
-  </div>
-
-  <iframe id="sandbox" src="sandbox/detector.html"
-          style="width:0;height:0;border:0;visibility:hidden"></iframe>
-
-  <script src="js/main.js"></script>
+    <video id="video" autoplay muted width="720" height="540"></video>
 </body>
 </html>
