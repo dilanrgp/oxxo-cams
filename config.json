@@ -1,0 +1,5 @@
+{
+  "faceRetentionMinutes": 5,
+  "faceMatchThreshold": 0.6,
+  "customer_id": "CLIENTE_001"
+}
