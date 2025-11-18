@@ -15,9 +15,51 @@
 
 const elVideo = document.getElementById('video')
 
+let cameraInactiveOverlayShown = false
+
+function showCameraInactiveOverlay() {
+    try {
+        cameraInactiveOverlayShown = true
+
+        document.body.style.backgroundColor = 'black'
+        if (elVideo) {
+            elVideo.style.display = 'none'
+        }
+
+        let overlay = document.getElementById('camera-inactive-overlay')
+        if (!overlay) {
+            overlay = document.createElement('div')
+            overlay.id = 'camera-inactive-overlay'
+            overlay.textContent = 'cámara inactiva'
+            overlay.style.position = 'fixed'
+            overlay.style.top = '0'
+            overlay.style.left = '0'
+            overlay.style.right = '0'
+            overlay.style.bottom = '0'
+            overlay.style.display = 'flex'
+            overlay.style.alignItems = 'center'
+            overlay.style.justifyContent = 'center'
+            overlay.style.fontSize = '32px'
+            overlay.style.color = '#ffffff'
+            overlay.style.backgroundColor = '#000000'
+            overlay.style.zIndex = '9999'
+            document.body.appendChild(overlay)
+        } else {
+            overlay.style.display = 'flex'
+        }
+    } catch (err) {
+        console.error('Error mostrando overlay de cámara inactiva:', err)
+    }
+}
+
 navigator.getMedia = (navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia)
 
 const cargarCamera = () => {
+    if (config.status === false) {
+        showCameraInactiveOverlay()
+        return
+    }
+
     navigator.getMedia(
         {
             video: true,
@@ -53,7 +95,7 @@ let config = {
 }
 
 // Umbral máximo de distancia para considerar que es la misma cara
-let FACE_MATCH_THRESHOLD = 0.6
+let FACE_MATCH_THRESHOLD = 0.7
 
 // Suavizado de edad (0–1). Cuanto más alto, más rápido cambia;
 // cuanto más bajo, más estable pero más lento en ajustarse.
@@ -89,8 +131,8 @@ function loadConfig() {
             return response.json()
         })
         .then(data => {
-            if (data && typeof data.faceRetentionMinutes === 'number') {
-                config.faceRetentionMs = data.faceRetentionMinutes * 60 * 1000
+            if (data && typeof data.faceRetentionSeconds === 'number') {
+                config.faceRetentionMs = data.faceRetentionSeconds * 1000
             }
             if (data && typeof data.faceMatchThreshold === 'number') {
                 FACE_MATCH_THRESHOLD = data.faceMatchThreshold
@@ -115,6 +157,27 @@ function loadConfig() {
 
             if (data && typeof data.email === 'string') {
                 config.email = data.email
+            }
+
+            // CONSTANTE DETECCIÓN DE CARAS
+            if (data && typeof data.detectionIntervalMs === 'number') {
+                config.detectionIntervalMs = data.detectionIntervalMs
+            }
+
+            if (data && typeof data.maxDescriptorsPerFace === 'number') {
+                config.maxDescriptorsPerFace = data.maxDescriptorsPerFace
+            }
+
+            if (data && typeof data.maxFacesPerFrame === 'number') {
+                config.maxFacesPerFrame = data.maxFacesPerFrame
+            }
+
+            if (data && Array.isArray(data.schedule)) {
+                config.schedule = data.schedule
+            }
+
+            if (data && typeof data.apiurl === 'string') {
+                config.apiurl = data.apiurl
             }
 
             // Área de detección + estilo
@@ -143,6 +206,8 @@ function loadConfig() {
                 config.showGenderCounter = data.showGenderCounter
             }
 
+            applyCameraConfigOverridesFromStorage()
+
             console.log('Config cargada:', config, 'threshold:', FACE_MATCH_THRESHOLD)
         })
         .catch(err => {
@@ -150,7 +215,110 @@ function loadConfig() {
         })
 }
 
+function applyCameraConfigOverridesFromStorage() {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
+        console.warn('chrome.storage.local no disponible; se usan solo valores de config.json')
+        return
+    }
 
+    chrome.storage.local.get(['cameraConfigStatus', 'cameraConfig'], (result) => {
+        if (chrome.runtime && chrome.runtime.lastError) {
+            console.warn('Error leyendo cameraConfig desde storage.local:',
+                chrome.runtime.lastError.message)
+            return
+        }
+
+        const status = result.cameraConfigStatus
+        const override = result.cameraConfig
+
+        // Si el status es false o no hay respuesta válida del API → cámara inactiva
+        if (status === false) {
+            config.status = false
+            showCameraInactiveOverlay()
+            console.log('Config: cámara marcada como inactiva desde storage.local')
+            return
+        }
+
+        // Si hay override con status true, aplicamos los valores
+        if (status === true && override && typeof override === 'object') {
+            config.status = true
+
+            // faceRetentionSeconds → faceRetentionMs
+            if (typeof override.faceRetentionSeconds === 'number') {
+                config.faceRetentionMs = override.faceRetentionSeconds * 1000
+            }
+
+            // faceMatchThreshold
+            if (typeof override.faceMatchThreshold === 'number') {
+                FACE_MATCH_THRESHOLD = override.faceMatchThreshold
+            }
+
+            // IDs y email
+            if (typeof override.customerid !== 'undefined') {
+                config.customerId = Number(override.customerid)
+            }
+            if (typeof override.idsite !== 'undefined') {
+                config.siteId = Number(override.idsite)
+            }
+            if (typeof override.idcamera !== 'undefined') {
+                config.cameraId = Number(override.idcamera)
+            }
+            if (typeof override.email === 'string') {
+                config.email = override.email
+            }
+
+            // Área de detección
+            if (override.detectArea && typeof override.detectArea === 'object') {
+                const da = override.detectArea
+                config.detectArea = {
+                    enabled: da.enabled !== false,
+                    x: typeof da.x === 'number' ? da.x : 0,
+                    y: typeof da.y === 'number' ? da.y : 0,
+                    width: typeof da.width === 'number' ? da.width : elVideo.width,
+                    height: typeof da.height === 'number' ? da.height : elVideo.height
+                }
+            }
+
+            // Horario: puede ser array o null
+            if (Array.isArray(override.schedule)) {
+                config.schedule = override.schedule
+            } else {
+                // schedule null o no definido -> detectar siempre
+                config.schedule = null
+            }
+
+            console.log('Config aplicada desde chrome.storage.local:', override)
+        } else {
+            console.log('No hay override de cámara en storage.local; se usan valores de config.json')
+        }
+    })
+}
+
+function isWithinSchedule(now = new Date()) {
+    // Si no hay schedule definido, se detecta siempre
+    if (!Array.isArray(config.schedule) || config.schedule.length === 0) {
+        return true
+    }
+
+    // JS: 0 = domingo, 1 = lunes, ..., 6 = sábado
+    const jsWeekday = now.getDay()
+    const weekday = jsWeekday === 0 ? 7 : jsWeekday // 1–7
+
+    const hh = String(now.getHours()).padStart(2, '0')
+    const mm = String(now.getMinutes()).padStart(2, '0')
+    const ss = String(now.getSeconds()).padStart(2, '0')
+    const currentTime = `${hh}:${mm}:${ss}`
+
+    return config.schedule.some(slot => {
+        if (slot.weekday !== weekday) return false
+
+        const from = slot.time_on || '00:00:00'
+        const to = slot.time_off || '23:59:59'
+
+        // Comparación lexicográfica funciona porque el formato es HH:MM:SS
+        return currentTime >= from && currentTime <= to
+    })
+}
 
 
 // Llamamos a la carga de config al inicio
@@ -197,7 +365,6 @@ async function sendFaceExpiredToApi(face, now) {
         }
 
         const { ts, keyhash } = await getTimestampAndKeyhash()
-
         const url = `${config.apiurl}?timestamp=${ts}&keyhash=${keyhash}`
 
         const ageNumber = (typeof face.age === 'number') ? Math.round(face.age) : null
@@ -209,7 +376,6 @@ async function sendFaceExpiredToApi(face, now) {
         const end = (typeof face.lastSeen === 'number') ? face.lastSeen : now
         const durationSec = Math.max(0, Math.round((end - start) / 1000))
 
-        // fecha/hora de envío (puedes ajustar el formato si el backend exige algo concreto)
         const date_time = new Date(end).toISOString()
 
         const payload = {
@@ -224,24 +390,47 @@ async function sendFaceExpiredToApi(face, now) {
             positions: [
                 { x: 112.2, y: 334.4 },
                 { x: 556.6, y: 778.8 },
-            ],      // por ahora vacío, como comentaste
+            ],
             datetime: date_time
         }
 
-        const response = await fetch(url, {
-            method: 'PUT',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(payload)
-        })
+        const hasChromeRuntime =
+            typeof chrome !== 'undefined' &&
+            chrome.runtime &&
+            typeof chrome.runtime.sendMessage === 'function'
 
-        if (!response.ok) {
-            const text = await response.text().catch(() => '')
-            console.error('Error al enviar datos a la API:', response.status, text)
+        if (hasChromeRuntime) {
+            // En extensión: delegamos el envío al service worker
+            chrome.runtime.sendMessage(
+                { type: 'SEND_FACE_EVENT', url, payload },
+                (response) => {
+                    if (chrome.runtime.lastError) {
+                        console.warn('Error al enviar evento a bg.js:', chrome.runtime.lastError.message)
+                        return
+                    }
+                    if (!response || !response.ok) {
+                        console.warn('bg.js devolvió error al enviar evento de cara:', response)
+                    } else {
+                        console.log('FACE_EXPIRED enviado a API (via bg.js):', payload)
+                    }
+                }
+            )
         } else {
-            // Si quieres ver algo en consola mientras pruebas:
-            console.log('FACE_EXPIRED enviado a API:', payload)
+            // Fallback por si se ejecuta fuera de la extensión (por ejemplo, debug en navegador)
+            const response = await fetch(url, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(payload)
+            })
+
+            if (!response.ok) {
+                const text = await response.text().catch(() => '')
+                console.error('Error al enviar datos a la API:', response.status, text)
+            } else {
+                console.log('FACE_EXPIRED enviado a API:', payload)
+            }
         }
     } catch (err) {
         console.error('Excepción al enviar datos a la API:', err)
@@ -250,7 +439,6 @@ async function sendFaceExpiredToApi(face, now) {
 
 
 // Dado un descriptor de cara, devuelve un ID existente o crea uno nuevo
-// Ahora también recibimos edad y género para guardarlos
 function getOrCreateFaceId(descriptor, age, gender, excludedFaceIds = new Set()) {
     if (!descriptor) {
         return null
@@ -301,8 +489,10 @@ function getOrCreateFaceId(descriptor, age, gender, excludedFaceIds = new Set())
         }
         bestMatchFace.gender = normalizedGender || gender
 
+        const maxDesc = config.maxDescriptorsPerFace || 5
+
         // Añadimos el nuevo descriptor para mejorar robustez, con un máximo
-        if (bestMatchFace.descriptors.length < MAX_DESCRIPTORS_PER_FACE) {
+        if (bestMatchFace.descriptors.length < maxDesc) {
             bestMatchFace.descriptors.push(descriptor)
         } else {
             // Si está lleno, podemos sustituir el más antiguo / aleatorio, aquí quitamos el primero
@@ -317,8 +507,8 @@ function getOrCreateFaceId(descriptor, age, gender, excludedFaceIds = new Set())
     const newFace = {
         id: nextFaceId++,
         descriptors: [descriptor],
-        firstSeen: now,          // NUEVO: marca de tiempo de primera vez visto
-        lastSeen: now,           // última vez visto
+        firstSeen: now,
+        lastSeen: now,
         age,
         gender: normalizedGender || gender
     }
@@ -339,6 +529,14 @@ function getOrCreateFaceId(descriptor, age, gender, excludedFaceIds = new Set())
 function isInDetectArea(box) {
     if (!config.detectArea || config.detectArea.enabled === false) {
         // si no hay área configurada, aceptamos todas las caras
+
+        if (typeof config.minFaceWidth === 'number' && box.width < config.minFaceWidth) {
+            return false
+        }
+        if (typeof config.minFaceHeight === 'number' && box.height < config.minFaceHeight) {
+            return false
+        }
+
         return true
     }
 
@@ -350,12 +548,24 @@ function isInDetectArea(box) {
     const areaRight = area.x + area.width
     const areaBottom = area.y + area.height
 
-    return (
+    const insideArea =
         centerX >= area.x &&
         centerX <= areaRight &&
         centerY >= area.y &&
         centerY <= areaBottom
-    )
+
+    if (!insideArea) {
+        return false
+    }
+
+    if (typeof config.minFaceWidth === 'number' && box.width < config.minFaceWidth) {
+        return false
+    }
+    if (typeof config.minFaceHeight === 'number' && box.height < config.minFaceHeight) {
+        return false
+    }
+
+    return true
 }
 
 // Dibujar contador de género arriba a la derecha del canvas
@@ -421,6 +631,24 @@ elVideo.addEventListener('play', async () => {
 
     setInterval(async () => {
         const now = Date.now()
+        const nowDate = new Date(now)
+
+        // Si la cámara está inactiva, limpiamos y no hacemos nada
+        if (config.status === false) {
+            const ctx = canvas.getContext('2d', { willReadFrequently: true })
+            ctx.clearRect(0, 0, canvas.width, canvas.height)
+            if (!cameraInactiveOverlayShown) {
+                showCameraInactiveOverlay()
+            }
+            return
+        }
+
+        // Si no estamos dentro de horario, no detectamos
+        if (!isWithinSchedule(nowDate)) {
+            const ctx = canvas.getContext('2d', { willReadFrequently: true })
+            ctx.clearRect(0, 0, canvas.width, canvas.height)
+            return
+        }
 
         // 1. Buscar caras que han expirado (pasado el tiempo configurado)
         const expiredFaces = knownFaces.filter(face => (now - face.lastSeen) > config.faceRetentionMs)
@@ -444,6 +672,12 @@ elVideo.addEventListener('play', async () => {
 
         // Ajustar detecciones al tamaño del vídeo
         const resizedDetections = faceapi.resizeResults(detections, displaySize)
+
+        let detectionsToUse = resizedDetections
+
+        if (typeof config.maxFacesPerFrame === 'number') {
+            detectionsToUse = resizedDetections.slice(0, config.maxFacesPerFrame)
+        }
 
         const ctx = canvas.getContext('2d', { willReadFrequently: true })
         // 3. Limpiar el canvas
@@ -476,7 +710,7 @@ elVideo.addEventListener('play', async () => {
         const usedFaceIdsThisFrame = new Set()
 
         // 3.2 Dibujar las cajas con el ID SOLO si están dentro del área
-        resizedDetections.forEach((detection, index) => {
+        detectionsToUse.forEach((detection, index) => {
             const box = detection.detection.box
 
             // Si la cara no está dentro del área de detección, la ignoramos
@@ -518,5 +752,30 @@ elVideo.addEventListener('play', async () => {
 
         // 3.3 Dibujar contador de género (si está activado)
         drawGenderCounter(ctx, canvas)
-    }, 80)
+    }, config.detectionIntervalMs)
 })
+
+// =========================
+// Flush de caras pendientes al cerrar / recargar
+// =========================
+let hasFlushedOnUnload = false
+
+function flushAllFacesOnUnload() {
+    if (hasFlushedOnUnload) return
+    hasFlushedOnUnload = true
+
+    try {
+        if (!knownFaces || knownFaces.length === 0) return
+
+        const now = Date.now()
+        const facesToSend = [...knownFaces]
+
+        facesToSend.forEach(face => {
+            sendFaceExpiredToApi(face, now)
+        })
+    } catch (err) {
+        console.error('Error al hacer flush de caras pendientes en beforeunload/unload:', err)
+    }
+}
+
+window.addEventListener('beforeunload', flushAllFacesOnUnload)

@@ -35,8 +35,12 @@
     }
   ],
 
-  "permissions": [],
+  "permissions": [
+    "storage",
+    "enterprise.deviceAttributes"
+  ],
   "host_permissions": [
-    "https://people.ladorianids.es/*"
+    "https://people.ladorianids.es/*",
+    "https://ids.ladorianids.es/*"
   ]
 }

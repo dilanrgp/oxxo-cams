@@ -1,12 +1,21 @@
 {
-    "faceRetentionMinutes": 5,
+    "status": true,
+    "faceRetentionSeconds": 300,
     "faceMatchThreshold": 0.7,
+    
+    "detectionIntervalMs": 80,
+    "maxFacesPerFrame": null,
+    "minFaceWidth": 80,
+    "minFaceHeight": 80,
+    "maxDescriptorsPerFace": 5,
+
     "customerid": 321,
     "idsite": 36532,
     "idcamera": 471,
     "email": "laboratorio@ladorian.com",
     "showGenderCounter": true,
     "apiurl": "https://people.ladorianids.es/ws/people/create",
+    "configapiurl": "https://ids.ladorianids.es/protected/camera/auth",
     "detectArea": {
         "enabled": true,
         "x": 160,
@@ -21,5 +30,17 @@
                 4
             ]
         }
-    }
+    },
+    "schedule": [
+        {
+            "weekday": 1,
+            "time_on": "04:00:00",
+            "time_off": "23:00:00"
+        },
+        {
+            "weekday": 2,
+            "time_on": "08:00:00",
+            "time_off": "20:00:00"
+        }
+    ]
 }
